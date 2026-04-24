@@ -313,7 +313,8 @@ class ThermalNerfModel(ThermalNerfactoModel):
         thermal_ray_bundle = thermal_cameras.generate_rays(
             camera_indices=camera_indices, coords=coords
         )
-        return self._offset_thermal_camera_indices(thermal_ray_bundle)
+        thermal_ray_bundle = self._offset_thermal_camera_indices(thermal_ray_bundle)
+        return self.collider(thermal_ray_bundle)
 
     def _get_eval_thermal_outputs(
         self, batch: dict[str, torch.Tensor]
