@@ -308,7 +308,7 @@ class ThermalNerfModel(ThermalNerfactoModel):
 
         thermal_cameras = self.thermal_cameras.to(self.device)
         ray_indices = batch["indices"]
-        camera_indices = ray_indices[..., 0].long()
+        camera_indices = ray_indices[..., 0:1].long()
         coords = ray_indices[..., 1:].long()
         thermal_ray_bundle = thermal_cameras.generate_rays(
             camera_indices=camera_indices, coords=coords
