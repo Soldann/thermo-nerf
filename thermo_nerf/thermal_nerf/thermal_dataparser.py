@@ -26,6 +26,9 @@ from nerfstudio.utils.io import load_from_json
 
 from thermo_nerf.rendered_image_modalities import RenderedImageModality
 
+THERMAL_CAMERAS_METADATA_KEY = "thermal_cameras"
+THERMAL_POSES_METADATA_KEY = "has_separate_thermal_poses"
+
 
 @dataclass
 class ThermalDataParserConfig(NerfstudioDataParserConfig):
@@ -80,6 +83,8 @@ class Thermal(Nerfstudio):
         mask_filenames = []
         thermal_filenames = []
         poses = []
+        thermal_poses = []
+        has_separate_thermal_poses = False
 
         fx_fixed = "fl_x" in meta
         fy_fixed = "fl_y" in meta
@@ -155,6 +160,13 @@ class Thermal(Nerfstudio):
                 )
                 thermal_filenames.append(thermal_fname)
 
+            thermal_transform_matrix = frame.get("thermal_transform_matrix")
+            if thermal_transform_matrix is None:
+                thermal_poses.append(np.array(frame["transform_matrix"]))
+            else:
+                thermal_poses.append(np.array(thermal_transform_matrix))
+                has_separate_thermal_poses = True
+
         has_split_files_spec = any(
             f"{split}_filenames" in meta for split in ("train", "val", "test")
         )
@@ -215,6 +227,15 @@ class Thermal(Nerfstudio):
             method=orientation_method,
             center_method=self.config.center_method,
         )
+        thermal_poses = torch.from_numpy(np.array(thermal_poses).astype(np.float32))
+        if has_separate_thermal_poses:
+            transform_matrix_4x4 = torch.eye(4, dtype=transform_matrix.dtype)
+            transform_matrix_4x4[:3, :4] = transform_matrix
+            thermal_poses = torch.einsum(
+                "ij,njk->nik", transform_matrix_4x4, thermal_poses
+            )
+        else:
+            thermal_poses = poses.clone()
 
         # Scale poses
         scale_factor = 1.0
@@ -223,6 +244,7 @@ class Thermal(Nerfstudio):
         scale_factor *= self.config.scale_factor
 
         poses[:, :3, 3] *= scale_factor
+        thermal_poses[:, :3, 3] *= scale_factor
 
         # Choose image_filenames and poses based on split, but after auto orient
         # and scaling the poses.
@@ -236,6 +258,7 @@ class Thermal(Nerfstudio):
 
         idx_tensor = torch.tensor(indices, dtype=torch.long)
         poses = poses[idx_tensor]
+        thermal_poses = thermal_poses[idx_tensor]
 
         # in x,y,z order
         # assumes that the scene is centered at the origin
@@ -311,6 +334,20 @@ class Thermal(Nerfstudio):
 
         assert self.downscale_factor is not None
         cameras.rescale_output_resolution(scaling_factor=1.0 / self.downscale_factor)
+        thermal_cameras = Cameras(
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            distortion_params=distortion_params,
+            height=height,
+            width=width,
+            camera_to_worlds=thermal_poses[:, :3, :4],
+            camera_type=camera_type,
+        )
+        thermal_cameras.rescale_output_resolution(
+            scaling_factor=1.0 / self.downscale_factor
+        )
 
         if "applied_transform" in meta:
             applied_transform = torch.tensor(
@@ -338,6 +375,8 @@ class Thermal(Nerfstudio):
                 RenderedImageModality.THERMAL.value: (
                     thermal_filenames if len(thermal_filenames) > 0 else None
                 ),
+                THERMAL_CAMERAS_METADATA_KEY: thermal_cameras,
+                THERMAL_POSES_METADATA_KEY: has_separate_thermal_poses,
             },
         )
         return dataparser_outputs

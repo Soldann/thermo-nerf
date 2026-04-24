@@ -37,6 +37,10 @@ from thermo_nerf.nerfacto_config.thermal_nerfacto import (
     ThermalNerfactoModelConfig,
 )
 from thermo_nerf.rendered_image_modalities import RenderedImageModality
+from thermo_nerf.thermal_nerf.thermal_dataparser import (
+    THERMAL_CAMERAS_METADATA_KEY,
+    THERMAL_POSES_METADATA_KEY,
+)
 from thermo_nerf.thermal_nerf.thermal_field import ThermalNerfactoTField
 from thermo_nerf.thermal_nerf.thermal_field_head import FieldHeadNamesT
 from thermo_nerf.thermal_nerf.thermal_metrics import mae_thermal
@@ -75,6 +79,13 @@ class ThermalNerfModel(ThermalNerfactoModel):
         if RenderedImageModality.THERMAL.value not in metadata.keys():
             raise ValueError("Thermal images not found in metadata.")
 
+        self.thermal_cameras = metadata.get(THERMAL_CAMERAS_METADATA_KEY)
+        self.has_separate_thermal_poses = bool(
+            metadata.get(THERMAL_POSES_METADATA_KEY, False)
+        )
+        self.num_pose_embeddings = num_train_data * (
+            2 if self.has_separate_thermal_poses else 1
+        )
         super().__init__(config, scene_box, num_train_data, **kwargs)
         self.config = config
         self.max_temperature = config.max_temperature
@@ -104,7 +115,7 @@ class ThermalNerfModel(ThermalNerfactoModel):
             hidden_dim_color=self.config.hidden_dim_color,
             hidden_dim_transient=self.config.hidden_dim_transient,
             spatial_distortion=scene_contraction,
-            num_images=self.num_train_data,
+            num_images=self.num_pose_embeddings,
             use_pred_normals=self.config.predict_normals,
             use_average_appearance_embedding=self.config.use_average_appearance_embedding,  # noqa: E501
             appearance_embedding_dim=self.config.appearance_embed_dim,
@@ -113,7 +124,7 @@ class ThermalNerfModel(ThermalNerfactoModel):
             pass_thermal_gradients=self.config.pass_thermal_gradients,
         )
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
-            num_cameras=self.num_train_data, device="cpu"
+            num_cameras=self.num_pose_embeddings, device="cpu"
         )
         self.density_fns = []
         num_prop_nets = self.config.num_proposal_iterations
@@ -274,6 +285,52 @@ class ThermalNerfModel(ThermalNerfactoModel):
 
         return outputs
 
+    def _offset_thermal_camera_indices(self, ray_bundle: RayBundle) -> RayBundle:
+        """Offsets thermal camera indices so RGB and thermal poses can optimize independently."""
+
+        if (
+            not self.has_separate_thermal_poses
+            or ray_bundle.camera_indices is None
+            or ray_bundle.camera_indices.numel() == 0
+        ):
+            return ray_bundle
+
+        ray_bundle.camera_indices = ray_bundle.camera_indices + self.num_train_data
+        return ray_bundle
+
+    def _get_thermal_ray_bundle_from_batch(
+        self, batch: dict[str, torch.Tensor]
+    ) -> RayBundle | None:
+        """Builds a thermal ray bundle from sampled pixel indices when separate poses exist."""
+
+        if self.thermal_cameras is None or "indices" not in batch:
+            return None
+
+        thermal_cameras = self.thermal_cameras.to(self.device)
+        ray_indices = batch["indices"]
+        camera_indices = ray_indices[..., 0].long()
+        coords = ray_indices[..., 1:].long()
+        thermal_ray_bundle = thermal_cameras.generate_rays(
+            camera_indices=camera_indices, coords=coords
+        )
+        return self._offset_thermal_camera_indices(thermal_ray_bundle)
+
+    def _get_eval_thermal_outputs(
+        self, batch: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor] | None:
+        """Renders the thermal image from the thermal camera pose for eval metrics."""
+
+        if self.thermal_cameras is None or "image_idx" not in batch:
+            return None
+
+        thermal_cameras = self.thermal_cameras.to(self.device)
+        image_idx = batch["image_idx"]
+        if isinstance(image_idx, torch.Tensor):
+            image_idx = int(image_idx.reshape(-1)[0].item())
+        thermal_ray_bundle = thermal_cameras.generate_rays(camera_indices=image_idx)
+        thermal_ray_bundle = self._offset_thermal_camera_indices(thermal_ray_bundle)
+        return self.get_outputs_for_camera_ray_bundle(thermal_ray_bundle)
+
     def get_loss_dict(
         self,
         outputs: dict[str, torch.Tensor],
@@ -317,10 +374,15 @@ class ThermalNerfModel(ThermalNerfactoModel):
                 )
 
         thermal_batch = batch[RenderedImageModality.THERMAL.value].to(self.device)
+        thermal_outputs = outputs
+        if self.has_separate_thermal_poses:
+            thermal_ray_bundle = self._get_thermal_ray_bundle_from_batch(batch)
+            if thermal_ray_bundle is not None:
+                thermal_outputs = self.get_outputs(thermal_ray_bundle)
 
         if self.field.pass_thermal_gradients:
             loss_dict[RenderedImageModality.THERMAL.value] = self.thermal_loss(
-                outputs[RenderedImageModality.THERMAL.value], thermal_batch
+                thermal_outputs[RenderedImageModality.THERMAL.value], thermal_batch
             )
 
         return loss_dict
@@ -337,9 +399,14 @@ class ThermalNerfModel(ThermalNerfactoModel):
         :returns: two dicts one for the metrics and and another for the images.
         """
         metrics_dict, images_dict = super().get_image_metrics_and_images(outputs, batch)
+        thermal_outputs = outputs
+        if self.has_separate_thermal_poses:
+            eval_thermal_outputs = self._get_eval_thermal_outputs(batch)
+            if eval_thermal_outputs is not None:
+                thermal_outputs = eval_thermal_outputs
 
         thermal = colormaps.apply_float_colormap(
-            outputs[RenderedImageModality.THERMAL.value], colormap="gray"
+            thermal_outputs[RenderedImageModality.THERMAL.value], colormap="gray"
         )
         gt_thermal = colormaps.apply_float_colormap(
             batch[RenderedImageModality.THERMAL.value].to(self.device), colormap="gray"
@@ -356,7 +423,7 @@ class ThermalNerfModel(ThermalNerfactoModel):
             None, ...
         ]
         predicted_thermal = torch.moveaxis(
-            outputs[RenderedImageModality.THERMAL.value], -1, 0
+            thermal_outputs[RenderedImageModality.THERMAL.value], -1, 0
         )[None, ...]
 
         psnr = self.psnr(gt_thermal, predicted_thermal)
